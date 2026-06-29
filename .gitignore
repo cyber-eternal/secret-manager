@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Vaults / local data (never commit secrets)
+*.db
+*.db-wal
+*.db-shm
+
+# Export / vault backup files
+*.smvault
+
+# Playwright MCP scratch output
+.playwright-mcp/
+
+# OS / editor
+.DS_Store
+*.log
+.vscode/
+.idea/

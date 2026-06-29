@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (html.dark). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---- Design tokens (dark = primary) ---- */
+:root {
+  --bg: #0f1117;
+  --bg-titlebar: #0b0d12;
+  --panel: #0c0e13;
+  --surface: #14171e;
+  --surface-raised: #15181f;
+  --border: #2a2d35;
+  --border-subtle: #1c1f27;
+  --text: #e2e8f0;
+  --text-secondary: #cbd5e1;
+  --text-muted: #64748b;
+  --text-dim: #475569;
+  --accent: #3b82f6;
+  --accent-fg: #93c5fd;
+  --accent-soft: rgba(59, 130, 246, 0.12);
+  --danger: #ef4444;
+  --danger-soft: rgba(239, 68, 68, 0.1);
+  --success: #22c55e;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, Menlo,
+    Monaco, "Cascadia Code", monospace;
+}
+
+html:not(.dark) {
+  --bg: #f8fafc;
+  --bg-titlebar: #f1f5f9;
+  --panel: #f8fafc;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --border: #e2e8f0;
+  --border-subtle: #eef2f6;
+  --text: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --text-dim: #94a3b8;
+  --accent: #2563eb;
+  --accent-fg: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.08);
+  --success: #16a34a;
+}
+
+/* Expose tokens to Tailwind utilities (bg-surface, text-muted, etc.) */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-titlebar: var(--bg-titlebar);
+  --color-panel: var(--panel);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-border-subtle: var(--border-subtle);
+  --color-text: var(--text);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-text-dim: var(--text-dim);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-success: var(--success);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  /* Scale the whole UI up ~10% for comfortable reading on desktop. */
+  zoom: 1.1;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+/* Thin, calm scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+  background-clip: content-box;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+/* Section label helper */
+.section-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--text-muted);
+}
