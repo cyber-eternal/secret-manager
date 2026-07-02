@@ -39,6 +39,8 @@ pub fn run() {
             commands::vault::biometric_unlock,
             commands::vault::biometric_disable,
             commands::vault::biometric_enrolled,
+            commands::vault::migration_backup_exists,
+            commands::vault::delete_migration_backup,
             // projects
             commands::projects::create_project,
             commands::projects::list_projects,

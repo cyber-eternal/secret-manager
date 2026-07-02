@@ -60,6 +60,12 @@ export const biometricUnlock = (vaultPath?: string) =>
 export const biometricDisable = (vaultPath?: string) =>
   invoke<void>("biometric_disable", { vaultPath });
 
+export const migrationBackupExists = (vaultPath?: string) =>
+  invoke<boolean>("migration_backup_exists", { vaultPath });
+
+export const deleteMigrationBackup = (vaultPath?: string) =>
+  invoke<void>("delete_migration_backup", { vaultPath });
+
 // ---- Projects ----
 export const createProject = (name: string, description?: string | null) =>
   invoke<Project>("create_project", { name, description: description ?? null });

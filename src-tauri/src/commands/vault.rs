@@ -297,3 +297,23 @@ pub fn biometric_enrolled(app: AppHandle, vault_path: Option<String>) -> Result<
     }
     Ok(crate::sidecar::Sidecar::load(&path)?.biometric_wrap.is_some())
 }
+
+/// Whether a plaintext `.bak` from legacy-vault migration is still on disk
+/// (for UI state — e.g. showing the "delete plaintext backup" banner).
+#[tauri::command]
+pub fn migration_backup_exists(app: AppHandle, vault_path: Option<String>) -> Result<bool> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    Ok(std::path::PathBuf::from(format!("{}.bak", path.display())).exists())
+}
+
+/// Delete the plaintext migration backup left behind by the legacy-vault
+/// migration. No-op if it doesn't exist.
+#[tauri::command]
+pub fn delete_migration_backup(app: AppHandle, vault_path: Option<String>) -> Result<()> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    let bak = std::path::PathBuf::from(format!("{}.bak", path.display()));
+    if bak.exists() {
+        std::fs::remove_file(&bak).map_err(|e| AppError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
