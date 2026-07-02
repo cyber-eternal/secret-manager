@@ -1,6 +1,6 @@
 // Full-screen gate: create vault (first run), unlock, or recover with a code.
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
 import { Button, Input, PasswordInput } from "./ui/controls";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -20,8 +20,15 @@ export function UnlockScreen() {
   const [error, setError] = useState<string | null>(null);
   const [showReset, setShowReset] = useState(false);
   const [weakAck, setWeakAck] = useState(false);
+  const [lockedFor, setLockedFor] = useState(0);
 
   const firstRun = !hasVault;
+
+  useEffect(() => {
+    if (lockedFor <= 0) return;
+    const t = setInterval(() => setLockedFor((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [lockedFor]);
 
   const resetFields = () => {
     setPassword("");
@@ -49,7 +56,10 @@ export function UnlockScreen() {
       }
       resetFields();
     } catch (err) {
-      setError(errMessage(err));
+      const msg = errMessage(err);
+      const m = msg.match(/try again in (\d+)s/i);
+      if (m) setLockedFor(parseInt(m[1], 10));
+      setError(msg);
     }
   };
 
@@ -138,11 +148,18 @@ export function UnlockScreen() {
               </p>
             )}
 
-            <Button type="submit" loading={busy} className="mt-6 w-full">
+            <Button
+              type="submit"
+              loading={busy}
+              disabled={!firstRun && lockedFor > 0}
+              className="mt-6 w-full"
+            >
               {firstRun ? (
                 <>
                   <ShieldPlus className="h-4 w-4" /> Create vault
                 </>
+              ) : lockedFor > 0 ? (
+                <>Locked — retry in {lockedFor}s</>
               ) : (
                 <>
                   <KeyRound className="h-4 w-4" /> Unlock
