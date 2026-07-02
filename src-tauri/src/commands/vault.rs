@@ -70,10 +70,22 @@ pub async fn unlock_vault(
     }
 
     let (key, conn) = if sidecar_exists {
-        let sc = crate::sidecar::Sidecar::load(&path)?;
-        let key = vault::unlock(&sc, &password)?;
-        let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
-        (key, conn)
+        let mut sc = crate::sidecar::Sidecar::load(&path)?;
+        let now = crate::db::now_ms();
+        crate::vault::check_rate_limit(&sc, now)?; // Err(RateLimited) short-circuits, no Argon2
+        match vault::unlock(&sc, &password) {
+            Ok(key) => {
+                crate::vault::record_success(&mut sc);
+                sc.save(&path)?;
+                let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
+                (key, conn)
+            }
+            Err(e) => {
+                crate::vault::record_failure(&mut sc, now);
+                sc.save(&path)?;
+                return Err(e);
+            }
+        }
     } else {
         // Legacy plaintext DB: migrate in place.
         let (key, sc) = crate::migrate::migrate_plaintext_to_encrypted(&path, &password)?;
