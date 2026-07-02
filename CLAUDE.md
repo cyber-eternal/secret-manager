@@ -249,10 +249,9 @@ Alongside `vault.db` you may also find:
 - `vault.db.bak` — present only after a legacy vault was migrated to v3 on
   unlock. This is the **original plaintext** database kept as a safety copy;
   it is not needed for normal operation and is deleted automatically if the
-  vault is later removed via `delete_vault`. There is currently no dedicated
-  Settings action to remove just the `.bak` — delete it manually once you've
-  confirmed the migrated vault works, or leave it until the vault itself is
-  deleted.
+  vault is later removed via `delete_vault`. Settings → "Delete plaintext
+  backup" removes just the `.bak` once you've confirmed the migrated vault
+  works (`migration_backup_exists`/`delete_migration_backup` commands).
 - `vault.db-wal` / `vault.db-shm` — normal SQLite WAL-mode files.
 
 ## Coding Conventions

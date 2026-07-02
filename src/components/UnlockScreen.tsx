@@ -7,6 +7,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { StrengthMeter } from "./StrengthMeter";
 import { estimateStrength, isWeak } from "../lib/passwordStrength";
 import { useVault } from "../store/vault";
+import { useSettings } from "../store/settings";
 import { errMessage, validateMasterPassword } from "../lib/utils";
 import {
   biometricAvailable as api_biometricAvailable,
@@ -36,12 +37,17 @@ export function UnlockScreen() {
     return () => clearInterval(t);
   }, [lockedFor]);
 
+  const customVaultPath = useSettings((s) => s.customVaultPath);
+
   useEffect(() => {
     if (firstRun) return;
-    Promise.all([api_biometricAvailable(), api_biometricEnrolled()])
+    Promise.all([
+      api_biometricAvailable(),
+      api_biometricEnrolled(customVaultPath ?? undefined),
+    ])
       .then(([a, e]) => setBioReady(a && e))
       .catch(() => setBioReady(false));
-  }, [firstRun]);
+  }, [firstRun, customVaultPath]);
 
   const resetFields = () => {
     setPassword("");
