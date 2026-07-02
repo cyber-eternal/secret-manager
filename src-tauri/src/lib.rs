@@ -34,6 +34,11 @@ pub fn run() {
             commands::vault::vault_is_unlocked,
             commands::vault::get_vault_path,
             commands::vault::change_master_password,
+            commands::vault::biometric_available,
+            commands::vault::biometric_enroll,
+            commands::vault::biometric_unlock,
+            commands::vault::biometric_disable,
+            commands::vault::biometric_enrolled,
             // projects
             commands::projects::create_project,
             commands::projects::list_projects,

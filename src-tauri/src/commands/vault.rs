@@ -208,3 +208,92 @@ pub async fn change_master_password(
     session.key = Some(Zeroizing::new(new_key));
     Ok(())
 }
+
+/// Whether biometric unlock is available on this platform + device. This is a
+/// capability check only (Secure Enclave / API present) — it does not prove a
+/// fingerprint is actually enrolled, nor that any vault has biometric unlock
+/// configured (see `biometric_enrolled` for that).
+#[tauri::command]
+pub fn biometric_available() -> Result<bool> {
+    Ok(crate::biometric::is_available())
+}
+
+/// Enroll biometric unlock for the currently-unlocked vault: generate a fresh
+/// random token, store it in the platform keychain behind a biometric ACL, and
+/// wrap the in-memory master key with that token in the sidecar.
+#[tauri::command]
+pub async fn biometric_enroll(state: State<'_, VaultState>) -> Result<()> {
+    let (master_key, path) = {
+        let session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
+        let key = *session.key.as_ref().ok_or(AppError::VaultLocked)?.clone();
+        let path = session.path.clone().ok_or(AppError::VaultLocked)?;
+        (key, path)
+    };
+    let token_bytes = crate::crypto::random_bytes(crate::crypto::KEY_LEN)?;
+    let mut token = [0u8; crate::crypto::KEY_LEN];
+    token.copy_from_slice(&token_bytes);
+
+    crate::biometric::store_token(&token)?;
+    let mut sc = crate::sidecar::Sidecar::load(&path)?;
+    crate::vault::wrap_master_for_biometric(&mut sc, &master_key, &token)?;
+    sc.save(&path)?;
+    Ok(())
+}
+
+/// Unlock the vault via biometric prompt (Touch ID / Face ID). Fetching the
+/// token from the keychain triggers the OS prompt.
+#[tauri::command]
+pub async fn biometric_unlock(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    vault_path: Option<String>,
+) -> Result<bool> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    if !crate::sidecar::Sidecar::exists(&path) {
+        return Err(AppError::VaultMissing);
+    }
+    let sc = crate::sidecar::Sidecar::load(&path)?;
+    if sc.biometric_wrap.is_none() {
+        return Err(AppError::NoRecovery);
+    }
+    let token_vec = crate::biometric::fetch_token()?; // Touch ID / Face ID prompt
+    if token_vec.len() != crate::crypto::KEY_LEN {
+        return Err(AppError::crypto("bad keychain token length"));
+    }
+    let mut token = [0u8; crate::crypto::KEY_LEN];
+    token.copy_from_slice(&token_vec);
+    let key = crate::vault::unwrap_master_from_biometric(&sc, &token)?;
+    let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
+
+    let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
+    session.db = Some(conn);
+    session.key = Some(Zeroizing::new(key));
+    session.path = Some(path);
+    Ok(true)
+}
+
+/// Disable biometric unlock: delete the keychain token and clear the sidecar
+/// wrap. Best-effort on the keychain deletion so a missing/already-removed
+/// token doesn't block clearing the sidecar.
+#[tauri::command]
+pub async fn biometric_disable(app: AppHandle, vault_path: Option<String>) -> Result<()> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    crate::biometric::delete_token().ok();
+    if crate::sidecar::Sidecar::exists(&path) {
+        let mut sc = crate::sidecar::Sidecar::load(&path)?;
+        crate::vault::clear_biometric(&mut sc);
+        sc.save(&path)?;
+    }
+    Ok(())
+}
+
+/// Whether the vault at the resolved path has biometric unlock configured
+/// (for UI state — e.g. showing "Enable" vs "Disable" in Settings).
+#[tauri::command]
+pub fn biometric_enrolled(app: AppHandle, vault_path: Option<String>) -> Result<bool> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    if !crate::sidecar::Sidecar::exists(&path) {
+        return Ok(false);
+    }
+    Ok(crate::sidecar::Sidecar::load(&path)?.biometric_wrap.is_some())
+}
