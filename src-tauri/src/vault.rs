@@ -154,6 +154,44 @@ pub fn has_recovery(sc: &Sidecar) -> bool {
     !sc.recovery.is_empty()
 }
 
+// ---------------------------------------------------------------------------
+// Unlock rate limiting (backoff persisted in the sidecar)
+// ---------------------------------------------------------------------------
+
+/// Backoff delay (ms) imposed after `failed_attempts` consecutive failures.
+pub fn backoff_delay_ms(failed_attempts: u32) -> i64 {
+    match failed_attempts {
+        0..=3 => 0,
+        4 => 5_000,
+        5 => 15_000,
+        6 => 30_000,
+        7 => 60_000,
+        _ => 300_000,
+    }
+}
+
+/// Reject if the vault is currently in a backoff window.
+pub fn check_rate_limit(sc: &Sidecar, now_ms: i64) -> Result<()> {
+    if now_ms < sc.locked_until_ms {
+        let secs = ((sc.locked_until_ms - now_ms) as f64 / 1000.0).ceil() as u64;
+        return Err(AppError::RateLimited { retry_after_secs: secs.max(1) });
+    }
+    Ok(())
+}
+
+/// Record a failed unlock: bump the counter and set the next allowed time.
+pub fn record_failure(sc: &mut Sidecar, now_ms: i64) {
+    sc.failed_attempts = sc.failed_attempts.saturating_add(1);
+    let delay = backoff_delay_ms(sc.failed_attempts);
+    sc.locked_until_ms = now_ms + delay;
+}
+
+/// Record a successful unlock: clear the counter and lock window.
+pub fn record_success(sc: &mut Sidecar) {
+    sc.failed_attempts = 0;
+    sc.locked_until_ms = 0;
+}
+
 /// Change the master password: re-wrap the (unchanged) master key.
 pub fn change_password(
     sc: &mut Sidecar,
@@ -275,6 +313,31 @@ mod tests {
             recover(&mut sc, "ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ", "new"),
             Err(AppError::WrongRecoveryCode)
         ));
+    }
+
+    #[test]
+    fn backoff_schedule_matches_spec() {
+        assert_eq!(backoff_delay_ms(1), 0);
+        assert_eq!(backoff_delay_ms(3), 0);
+        assert_eq!(backoff_delay_ms(4), 5_000);
+        assert_eq!(backoff_delay_ms(5), 15_000);
+        assert_eq!(backoff_delay_ms(6), 30_000);
+        assert_eq!(backoff_delay_ms(7), 60_000);
+        assert_eq!(backoff_delay_ms(8), 300_000);
+        assert_eq!(backoff_delay_ms(99), 300_000);
+    }
+
+    #[test]
+    fn rate_limit_blocks_until_expiry_then_clears_on_success() {
+        let (_k, mut sc, _c) = create_with_params("pw", fast_params()).unwrap();
+        // 4 failures -> locked for 5s from now.
+        for _ in 0..4 { record_failure(&mut sc, 1_000); }
+        assert!(matches!(check_rate_limit(&sc, 1_000), Err(AppError::RateLimited { .. })));
+        // After the window it's allowed again.
+        assert!(check_rate_limit(&sc, 1_000 + 5_001).is_ok());
+        record_success(&mut sc);
+        assert_eq!(sc.failed_attempts, 0);
+        assert_eq!(sc.locked_until_ms, 0);
     }
 
     #[test]
