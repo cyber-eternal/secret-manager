@@ -306,8 +306,8 @@ mod tests {
     use crate::{db, vault};
 
     fn setup() -> (Connection, [u8; KEY_LEN]) {
-        let conn = db::open_in_memory().unwrap();
-        let (key, _codes) = vault::create(&conn, "pw").unwrap();
+        let (key, _sc, _codes) = vault::create("pw").unwrap();
+        let conn = db::open_in_memory_keyed(&vault::key_hex(&key)).unwrap();
         (conn, key)
     }
 

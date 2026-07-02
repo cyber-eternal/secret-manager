@@ -1,30 +1,60 @@
 // Full-screen gate: create vault (first run), unlock, or recover with a code.
 
-import { useState, type FormEvent } from "react";
-import { KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
+import { Fingerprint, KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
 import { Button, Input, PasswordInput } from "./ui/controls";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { StrengthMeter } from "./StrengthMeter";
+import { estimateStrength, isWeak } from "../lib/passwordStrength";
 import { useVault } from "../store/vault";
+import { useSettings } from "../store/settings";
 import { errMessage, validateMasterPassword } from "../lib/utils";
+import {
+  biometricAvailable as api_biometricAvailable,
+  biometricEnrolled as api_biometricEnrolled,
+} from "../lib/tauri";
 
 type Mode = "auth" | "recover";
 
 export function UnlockScreen() {
-  const { hasVault, unlock, createVault, recover, resetVault, busy } = useVault();
+  const { hasVault, unlock, createVault, recover, resetVault, busy, biometricUnlock } =
+    useVault();
   const [mode, setMode] = useState<Mode>("auth");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showReset, setShowReset] = useState(false);
+  const [weakAck, setWeakAck] = useState(false);
+  const [lockedFor, setLockedFor] = useState(0);
+  const [bioReady, setBioReady] = useState(false);
 
   const firstRun = !hasVault;
+
+  useEffect(() => {
+    if (lockedFor <= 0) return;
+    const t = setInterval(() => setLockedFor((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [lockedFor]);
+
+  const customVaultPath = useSettings((s) => s.customVaultPath);
+
+  useEffect(() => {
+    if (firstRun) return;
+    Promise.all([
+      api_biometricAvailable(),
+      api_biometricEnrolled(customVaultPath ?? undefined),
+    ])
+      .then(([a, e]) => setBioReady(a && e))
+      .catch(() => setBioReady(false));
+  }, [firstRun, customVaultPath]);
 
   const resetFields = () => {
     setPassword("");
     setConfirm("");
     setCode("");
     setError(null);
+    setWeakAck(false);
   };
 
   const onAuthSubmit = async (e: FormEvent) => {
@@ -34,6 +64,10 @@ export function UnlockScreen() {
       if (firstRun) {
         const check = validateMasterPassword(password, confirm);
         if (!check.ok) return setError(check.message ?? "Invalid password");
+        if (isWeak(estimateStrength(password).score) && !weakAck) {
+          setWeakAck(true);
+          return setError("That password is weak. Click Create vault again to use it anyway.");
+        }
         await createVault(password);
       } else {
         if (!password) return setError("Enter your master password.");
@@ -41,7 +75,10 @@ export function UnlockScreen() {
       }
       resetFields();
     } catch (err) {
-      setError(errMessage(err));
+      const msg = errMessage(err);
+      const m = msg.match(/try again in (\d+)s/i);
+      if (m) setLockedFor(parseInt(m[1], 10));
+      setError(msg);
     }
   };
 
@@ -51,6 +88,10 @@ export function UnlockScreen() {
     if (!code.trim()) return setError("Enter a recovery code.");
     const check = validateMasterPassword(password, confirm);
     if (!check.ok) return setError(check.message ?? "Invalid password");
+    if (isWeak(estimateStrength(password).score) && !weakAck) {
+      setWeakAck(true);
+      return setError("That password is weak. Click Recover access again to use it anyway.");
+    }
     try {
       await recover(code.trim(), password);
       resetFields();
@@ -118,6 +159,7 @@ export function UnlockScreen() {
                 />
               </>
             )}
+            {firstRun && <StrengthMeter password={password} />}
 
             {error && (
               <p className="mt-3 text-[12.5px] text-danger" role="alert">
@@ -125,17 +167,43 @@ export function UnlockScreen() {
               </p>
             )}
 
-            <Button type="submit" loading={busy} className="mt-6 w-full">
+            <Button
+              type="submit"
+              loading={busy}
+              disabled={!firstRun && lockedFor > 0}
+              className="mt-6 w-full"
+            >
               {firstRun ? (
                 <>
                   <ShieldPlus className="h-4 w-4" /> Create vault
                 </>
+              ) : lockedFor > 0 ? (
+                <>Locked — retry in {lockedFor}s</>
               ) : (
                 <>
                   <KeyRound className="h-4 w-4" /> Unlock
                 </>
               )}
             </Button>
+
+            {!firstRun && bioReady && (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={async () => {
+                  setError(null);
+                  try {
+                    await biometricUnlock();
+                    resetFields();
+                  } catch (err) {
+                    setError(errMessage(err));
+                  }
+                }}
+                className="mt-3 w-full"
+              >
+                <Fingerprint className="h-4 w-4" /> Unlock with Touch ID
+              </Button>
+            )}
 
             {!firstRun && (
               <button
@@ -179,6 +247,7 @@ export function UnlockScreen() {
               placeholder="••••••••"
               className="font-mono"
             />
+            <StrengthMeter password={password} />
 
             {error && (
               <p className="mt-3 text-[12.5px] text-danger" role="alert">

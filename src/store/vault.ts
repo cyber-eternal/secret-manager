@@ -20,6 +20,7 @@ interface VaultState {
   init: () => Promise<void>;
   createVault: (password: string) => Promise<void>;
   unlock: (password: string) => Promise<void>;
+  biometricUnlock: () => Promise<void>;
   recover: (code: string, newPassword: string) => Promise<void>;
   resetVault: () => Promise<void>;
   acknowledgeRecoveryCodes: () => void;
@@ -70,6 +71,17 @@ export const useVault = create<VaultState>((set, get) => ({
     set({ busy: true, error: null });
     try {
       await api.unlockVault(password, vaultPath());
+      set({ isUnlocked: true });
+      await get().refreshProjects();
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  biometricUnlock: async () => {
+    set({ busy: true, error: null });
+    try {
+      await api.biometricUnlock(vaultPath());
       set({ isUnlocked: true });
       await get().refreshProjects();
     } finally {

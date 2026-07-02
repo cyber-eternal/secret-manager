@@ -2,13 +2,21 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Download, FolderOpen, KeyRound, Upload } from "lucide-react";
+import { Download, FolderOpen, KeyRound, Trash2, Upload } from "lucide-react";
 import { Button, Input, PasswordInput } from "../components/ui/controls";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Dialog } from "../components/ui/Dialog";
 import { RecoveryCodes } from "../components/RecoveryCodes";
+import { StrengthMeter } from "../components/StrengthMeter";
 import {
+  biometricAvailable,
+  biometricDisable,
+  biometricEnroll,
+  biometricEnrolled,
   changeMasterPassword,
+  deleteMigrationBackup,
   getVaultPath,
+  migrationBackupExists,
   regenerateRecoveryCodes,
 } from "../lib/tauri";
 import { exportAllFlow } from "../lib/transfer";
@@ -63,9 +71,31 @@ export function Settings() {
   const [codesBusy, setCodesBusy] = useState(false);
   const [codesErr, setCodesErr] = useState<string | null>(null);
 
+  // biometric (Touch ID) unlock
+  const [bioAvail, setBioAvail] = useState(false);
+  const [bioOn, setBioOn] = useState(false);
+
+  // migration backup (plaintext .bak left by legacy-vault migration)
+  const [backupExists, setBackupExists] = useState(false);
+  const [confirmDelBackup, setConfirmDelBackup] = useState(false);
+  const [backupErr, setBackupErr] = useState<string | null>(null);
+
   useEffect(() => {
     getVaultPath().then(setVaultPath).catch(() => setVaultPath(null));
   }, []);
+
+  useEffect(() => {
+    biometricAvailable().then(setBioAvail).catch(() => setBioAvail(false));
+    biometricEnrolled(settings.customVaultPath ?? undefined)
+      .then(setBioOn)
+      .catch(() => setBioOn(false));
+  }, [settings.customVaultPath]);
+
+  useEffect(() => {
+    migrationBackupExists(settings.customVaultPath ?? undefined)
+      .then(setBackupExists)
+      .catch(() => setBackupExists(false));
+  }, [settings.customVaultPath]);
 
   const submitPw = async (e: FormEvent) => {
     e.preventDefault();
@@ -132,6 +162,7 @@ export function Settings() {
                 onChange={(e) => setNewPw(e.target.value)}
                 className="font-mono"
               />
+              <StrengthMeter password={newPw} />
             </div>
             <div>
               <label className="section-label mb-1.5 block">Confirm new password</label>
@@ -160,6 +191,58 @@ export function Settings() {
               Change password
             </Button>
           </form>
+
+          {bioAvail && (
+            <div className="flex items-center justify-between border-t border-border pt-4">
+              <div>
+                <p className="text-[13px] text-text">Unlock with Touch ID</p>
+                <p className="text-[11.5px] text-text-muted">
+                  Store an unlock token in the macOS Keychain, protected by your
+                  fingerprint.
+                </p>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    if (bioOn) {
+                      await biometricDisable(settings.customVaultPath ?? undefined);
+                      setBioOn(false);
+                    } else {
+                      await biometricEnroll();
+                      setBioOn(true);
+                    }
+                  } catch (err) {
+                    setPwMsg({ ok: false, text: errMessage(err) });
+                  }
+                }}
+              >
+                {bioOn ? "Disable" : "Enable"}
+              </Button>
+            </div>
+          )}
+
+          {backupExists && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-[12.5px]">
+              <p className="mb-2 text-text">
+                A plaintext backup of your vault (<code>vault.db.bak</code>) was
+                kept during encryption migration. Delete it once you&apos;ve
+                confirmed the vault opens correctly.
+              </p>
+              {backupErr && <p className="mb-2 text-danger">{backupErr}</p>}
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={() => {
+                  setBackupErr(null);
+                  setConfirmDelBackup(true);
+                }}
+              >
+                <Trash2 className="h-4 w-4" /> Delete plaintext backup
+              </Button>
+            </div>
+          )}
         </Section>
 
         <Section title="Recovery codes">
@@ -351,6 +434,31 @@ export function Settings() {
           />
         )}
       </Dialog>
+
+      <ConfirmDialog
+        open={confirmDelBackup}
+        title="Delete plaintext backup"
+        message={
+          <>
+            This permanently deletes the plaintext <code>vault.db.bak</code> left
+            over from migrating your vault to encrypted storage. This cannot be
+            undone — make sure your encrypted vault opens and looks correct
+            first.
+          </>
+        }
+        confirmLabel="Delete backup"
+        onConfirm={async () => {
+          try {
+            await deleteMigrationBackup(settings.customVaultPath ?? undefined);
+            setBackupExists(false);
+            setConfirmDelBackup(false);
+          } catch (err) {
+            setBackupErr(errMessage(err));
+            setConfirmDelBackup(false);
+          }
+        }}
+        onClose={() => setConfirmDelBackup(false)}
+      />
     </div>
   );
 }
