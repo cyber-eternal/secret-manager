@@ -1,11 +1,14 @@
 //! secret-manager Tauri backend library.
 
+pub mod biometric;
 pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod migrate;
 pub mod models;
 pub mod repo;
+pub mod sidecar;
 pub mod state;
 pub mod transfer;
 pub mod vault;
@@ -31,6 +34,13 @@ pub fn run() {
             commands::vault::vault_is_unlocked,
             commands::vault::get_vault_path,
             commands::vault::change_master_password,
+            commands::vault::biometric_available,
+            commands::vault::biometric_enroll,
+            commands::vault::biometric_unlock,
+            commands::vault::biometric_disable,
+            commands::vault::biometric_enrolled,
+            commands::vault::migration_backup_exists,
+            commands::vault::delete_migration_backup,
             // projects
             commands::projects::create_project,
             commands::projects::list_projects,
