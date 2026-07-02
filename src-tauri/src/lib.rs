@@ -4,6 +4,7 @@ pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod migrate;
 pub mod models;
 pub mod repo;
 pub mod sidecar;
