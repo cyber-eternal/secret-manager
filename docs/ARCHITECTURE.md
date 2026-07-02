@@ -3,14 +3,21 @@
 ## Threat Model
 
 What we protect against:
-- **Disk theft / unauthorized file access** — vault file is encrypted at rest; useless without master password
+- **Disk theft / unauthorized file access** — the entire vault database is
+  encrypted at rest (full-DB SQLCipher, v3), including project names, secret
+  keys, tags, and values — not just secret values. Useless without the master
+  password, a recovery code, or (on macOS) an enrolled biometric.
 - **Memory scraping** — vault key zeroized on lock; secret values cleared from UI state on navigation
-- **Weak passwords** — Argon2id with high cost parameters makes brute force expensive
+- **Weak passwords** — Argon2id with high cost parameters makes brute force expensive; a client-side strength meter (zxcvbn) warns on weak passwords at creation/change/recovery time (advisory only, never blocks)
+- **Online guessing** — failed unlock attempts trigger an exponential backoff, persisted across restarts, so rapid password guessing against the unlock screen is throttled
 
 What we do NOT protect against (out of scope for v1):
 - Malware with root access on the user's machine
 - Compromised Tauri/OS process memory
 - Keyloggers capturing the master password
+- The one-time `.bak` plaintext copy left behind after migrating a legacy
+  pre-v3 vault (see "Legacy Migration" below) — it is plaintext by
+  necessity until removed
 
 ---
 
@@ -20,7 +27,7 @@ What we do NOT protect against (out of scope for v1):
 
 ```
 Input:  master_password (UTF-8 string)
-        salt (32 random bytes, stored in vault_meta)
+        salt (32 random bytes, stored as pw_salt in vault.meta.json)
 
 Algorithm: Argon2id
   m_cost:  65536  (64 MB memory)
@@ -28,19 +35,24 @@ Algorithm: Argon2id
   p_cost:  4      (parallelism)
   hash_len: 32    (256-bit output)
 
-Output: vault_key (32 bytes) — held in memory ONLY, never persisted
+Output: pw_key (32 bytes) — used only to unwrap the master key, held in
+        memory ONLY, never persisted. The master key it unwraps is likewise
+        memory-only (see "Envelope Encryption & Recovery" below).
 ```
 
 Argon2id is preferred over Argon2i/Argon2d because it resists both side-channel and GPU attacks.
 
-### Envelope Encryption & Recovery (vault format v2)
+### Envelope Encryption & Recovery (vault format v3)
 
-New vaults use envelope encryption. A random 32-byte **master key** encrypts all
-secret values. The master key is never stored in the clear — it is *wrapped*
+New vaults use envelope encryption combined with full-database encryption. A
+random 32-byte **master key** both (a) keys SQLCipher for the entire SQLite
+file and (b) is itself never stored in the clear — it is *wrapped*
 (AES-256-GCM) by:
 
 - a key derived from the **master password** (`master_wrap`)
 - a key derived from each **recovery code** (the `recovery` list)
+- optionally, a random **biometric token** stored in the macOS Keychain (see
+  "Biometric Unlock (macOS Touch ID)" below)
 
 ```
 master_key            = 32 random bytes (memory only)
@@ -48,60 +60,196 @@ pw_key                = Argon2id(password, pw_salt)
 master_wrap           = AES-256-GCM(pw_key, master_key)
 recovery[i].wrap      = AES-256-GCM(Argon2id(code_i, salt_i), master_key)
 verify_blob           = AES-256-GCM(master_key, "secret-manager-verify-v1")
-secret.value_encrypted= AES-256-GCM(master_key, plaintext)
+key_hex               = hex(master_key)              -- 64 hex chars
+SQLCipher key         = PRAGMA key = "x'<key_hex>'"   -- keys the whole DB file
 ```
 
-- **Unlock:** derive `pw_key` → decrypt `master_wrap` → master key → verify.
+- **Unlock:** derive `pw_key` → decrypt `master_wrap` → master key → verify →
+  open the SQLite file keyed with `key_hex`.
 - **Recover:** for each recovery entry, derive its key from the entered code and
   try to decrypt its wrap; on success, re-wrap the master key under a new
   password. 8 single-use codes are generated at creation and shown once.
-- **Change password / recover:** only the master-key wrap is rewritten — secret
-  values are **not** re-encrypted (the master key is stable).
+- **Change password / recover:** only the master-key wrap is rewritten — the
+  database is **not** re-encrypted (the master key, and therefore the
+  SQLCipher key, is stable).
 
-`vault_meta` (v2) stores: `vault_version=2`, `kdf_params`, `pw_salt`,
-`master_wrap`, `recovery` (JSON list of `{salt, wrap}`), `verify_blob`.
+Because the master key now keys the database directly, there is no separate
+per-value encryption step to describe here — see "Full-Database Encryption
+(SQLCipher)" below for what "encrypted" now covers.
 
-**Legacy v1 vaults** (direct password-derived key, no recovery) still unlock; a
-v1 password change re-encrypts secrets as before. New vaults are always v2.
+**Legacy pre-v3 vaults** (plaintext SQLite, field-level value encryption only)
+are migrated transparently on first unlock — see "Legacy Migration" below.
 
 ### Vault Verification
 
-On first vault creation, store a verification blob so we can confirm the correct password on unlock without decrypting all secrets:
+On first vault creation, store a verification blob (in the sidecar, see
+below) so we can confirm the correct password on unlock without opening the
+SQLCipher-encrypted database:
 
 ```
 verify_plaintext = "secret-manager-verify-v1"
 verify_nonce     = random 12 bytes
-verify_blob      = AES-256-GCM(vault_key, verify_plaintext, nonce=verify_nonce)
-stored           = hex(verify_nonce) + "." + hex(verify_blob)
+verify_blob      = AES-256-GCM(master_key, verify_plaintext, nonce=verify_nonce)
+stored           = hex(verify_nonce || verify_blob)   -- sc.verify in vault.meta.json
 ```
 
-On unlock: derive vault_key → attempt to decrypt verify_blob → success means correct password.
+On unlock: derive `pw_key` → decrypt `master_wrap` → candidate master key →
+attempt to decrypt `verify_blob` with it → success means correct password
+*before* we ever try to open the encrypted database file.
 
-### Secret Value Encryption
+### Full-Database Encryption (SQLCipher)
 
-Each secret value is independently encrypted:
+The vault database (`vault.db`) is encrypted at the file level using
+SQLCipher (via `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature),
+keyed directly with the 32-byte master key rendered as 64 hex characters:
 
 ```
-plaintext  = secret value (UTF-8 bytes)
-nonce      = random 12 bytes (unique per encryption operation)
-ciphertext = AES-256-GCM(vault_key, plaintext, nonce)
-stored     = nonce (12 bytes) || ciphertext  (as BLOB in SQLite)
+key_hex = hex(master_key)
+PRAGMA key = "x'<key_hex>'"   -- must be the first statement on a fresh connection
 ```
 
-AES-256-GCM provides both confidentiality and integrity. Any tampering with the ciphertext will cause decryption to fail with an authentication error.
+This is "raw key" mode (no additional KDF inside SQLCipher — the master key
+is already the output of Argon2id via the envelope above, so re-deriving
+inside SQLCipher would be redundant). Everything in the schema is opaque
+ciphertext without the key: project names, secret keys/descriptions, tags,
+and secret values. Per-value `AES-256-GCM` encryption (nonce prepended to
+ciphertext, as used by `crypto::encrypt`/`crypto::decrypt`) is still applied
+to `secrets.value_encrypted` on top of the file-level encryption — defense in
+depth, and it keeps the export/import and legacy-migration code paths (which
+read/write individual secret values) unchanged. Opening the file with the
+wrong key fails immediately on the first real query (SQLite reports
+`SQLITE_NOTADB` / "file is not a database"); see
+`db::tests::keyed_db_rejects_wrong_key`.
 
 ### Password Change
 
-For a **v2** vault, changing the password only re-derives `pw_key` from the new
-password + a fresh `pw_salt` and rewrites `master_wrap`. Secret values are
-untouched. Recovery wraps are left intact.
+For a v3 vault, changing the password only re-derives `pw_key` from the new
+password + a fresh `pw_salt` and rewrites `master_wrap` in the sidecar. The
+master key — and therefore the SQLCipher key and every row in the database —
+is untouched. Recovery wraps are left intact. The same holds for recovering
+via a code: only `pw_salt`/`master_wrap` are rewritten.
 
-For a **v1** legacy vault, the password change still re-encrypts every secret:
-1. Derive `old_vault_key` from old password
-2. Derive `new_vault_key` from new password + new salt
-3. Decrypt every `value_encrypted` with `old_vault_key`, re-encrypt with the new
-4. Update `vault_meta` with new salt + verify_blob — all in one SQLite
-   transaction (atomic, no partial state)
+**Legacy v1/v2 plaintext vaults**, once migrated to v3 (see "Legacy
+Migration" below), behave identically going forward. Migration itself is the
+only operation that touches the whole database — see below.
+
+### The `vault.meta.json` Sidecar
+
+Everything needed to derive/verify the master key **before** the SQLCipher
+database can be opened lives in a plaintext JSON file next to the vault,
+named `<vault_path>.meta.json` (e.g. `vault.db.meta.json`). This has to be
+plaintext-readable pre-unlock — it's the chicken-and-egg piece that lets us
+turn a password into the SQLCipher key in the first place. Structure
+(`Sidecar` in `src-tauri/src/sidecar.rs`):
+
+```jsonc
+{
+  "format": "secret-manager-meta",
+  "version": 3,
+  "kdf": { "m_cost": 65536, "t_cost": 3, "p_cost": 4 },
+  "pw_salt": "…hex…",
+  "master_wrap": "…hex, AES-256-GCM(pw_key, master_key)…",
+  "verify": "…hex, AES-256-GCM(master_key, verify_plaintext)…",
+  "recovery": [ { "salt": "…hex…", "wrap": "…hex…" }, /* 8 entries */ ],
+  "failed_attempts": 0,
+  "locked_until_ms": 0,
+  "biometric_wrap": null
+}
+```
+
+- Written atomically: serialized to `<sidecar>.tmp`, then renamed over the
+  target (`Sidecar::save`), so a crash mid-write can't corrupt it.
+- `failed_attempts` / `locked_until_ms` back the rate limiter (below);
+  `biometric_wrap` backs Touch ID unlock (below). Both are absent/zeroed on a
+  freshly created vault.
+- Losing the sidecar without a copy of `pw_salt`/`master_wrap`/`recovery`
+  makes the vault unrecoverable — back it up alongside `vault.db`.
+
+### Legacy Migration (pre-v3 → v3)
+
+Vaults created before this hardening pass stored everything (including
+`vault_meta` with `pw_salt`, `master_wrap`, `verify_blob`, etc.) as plaintext
+rows inside the SQLite file itself, and encrypted only `secrets.value_encrypted`.
+`unlock_vault` detects this case (no `vault.meta.json` sidecar exists yet, but
+the plaintext `vault.db` does) and migrates transparently, in `migrate.rs`:
+
+1. Open the legacy plaintext DB and read its `vault_meta` rows.
+2. **v2 legacy** (had `master_wrap`): derive `pw_key` from the entered
+   password + stored `pw_salt`, decrypt `master_wrap` to recover the existing
+   master key, verify it. The master key is preserved unchanged.
+3. **v1 legacy** (no `master_wrap`, key derived directly from the password):
+   derive the key and verify it; since secrets were field-encrypted directly
+   under that derived key, it must become the v3 master key as-is (a fresh
+   random key would orphan every encrypted value). A fresh `master_wrap` is
+   built to wrap it under the current password so future unlocks use the v3
+   path.
+4. Wrong password at this step aborts before any file is touched — no
+   partial migration.
+5. Export the plaintext DB's contents into a new file via SQLCipher's
+   `sqlcipher_export()`, keyed with the recovered/derived master key
+   (`ATTACH DATABASE '<new>' AS enc KEY "x'<key_hex>'"; SELECT
+   sqlcipher_export('enc');`).
+6. Rename the original plaintext file to `<path>.bak` and the new encrypted
+   file into place as `<path>`, then re-open it with the key and run a sanity
+   query to confirm it's structurally sound before returning success.
+7. Save the new `vault.meta.json` sidecar built from the recovered
+   KDF/wrap/verify/recovery data.
+
+The `.bak` file is a **one-time, plaintext** copy of the pre-migration
+database — kept deliberately (never deleted automatically after a successful
+migration) so an interrupted or buggy migration can't destroy data. It is
+removed automatically only if the vault is later deleted entirely via
+`delete_vault`. There is no dedicated Settings UI action to delete just the
+`.bak` today; users who want it gone once they've confirmed the migrated
+vault works correctly should remove the file manually.
+
+### Unlock Rate Limiting
+
+Failed unlock attempts are tracked in the sidecar (`failed_attempts`,
+`locked_until_ms`) and gated by an exponential backoff schedule
+(`vault::backoff_delay_ms`, enforced via `vault::check_rate_limit` /
+`record_failure` / `record_success`):
+
+| Consecutive failures | Backoff before next attempt |
+|---|---|
+| 0–3 | none |
+| 4 | 5 s |
+| 5 | 15 s |
+| 6 | 30 s |
+| 7 | 60 s |
+| 8+ | 300 s (5 min), does not grow further |
+
+`unlock_vault` checks the rate limit **before** running Argon2id (so a
+blocked attempt doesn't even pay the KDF cost), and persists the updated
+counters to the sidecar after every attempt. A blocked attempt returns
+`AppError::RateLimited { retry_after_secs }`, which the UI surfaces as a
+countdown on the unlock button. The backoff is intentionally capped and
+always time-bounded — there is no failure count that permanently locks the
+vault; a correct password (or valid recovery code, which is not
+rate-limited by this counter) always works once the window elapses.
+
+### Biometric Unlock (macOS Touch ID)
+
+On macOS, once a vault is unlocked, a user can enroll biometric unlock
+(`biometric.rs` + `vault::wrap_master_for_biometric`):
+
+1. Generate a fresh random 32-byte token.
+2. Store it in the macOS Keychain as a generic password, gated by a
+   biometry-backed `SecAccessControl` (`BIOMETRY_CURRENT_SET | USER_PRESENCE`,
+   `AccessibleWhenUnlockedThisDeviceOnly`) via `security-framework`.
+   `BIOMETRY_CURRENT_SET` invalidates the Keychain item if the enrolled
+   fingerprint/Face ID set changes, and `USER_PRESENCE` allows a passcode
+   fallback if biometry is briefly unavailable.
+3. Wrap the in-memory master key with that token (`AES-256-GCM(token,
+   master_key)`) and store the wrap in the sidecar's `biometric_wrap` field.
+
+Unlocking via Touch ID (`biometric_unlock`) fetches the token from the
+Keychain — which triggers the OS Touch ID/Face ID prompt — then uses it to
+unwrap and verify the master key exactly like a password unlock, and opens
+the SQLCipher database with it. Disabling (`biometric_disable`) deletes the
+Keychain item and clears `biometric_wrap` from the sidecar. Biometric unlock
+is macOS-only; `biometric.rs` compiles to a no-op stub (`AppError::Unsupported`)
+on other platforms, and `biometric_available` reports `false` there.
 
 ### Export / Import
 
@@ -125,9 +273,12 @@ within a project; duplicate keys are resolved by the chosen mode (`skip` |
 
 The IPC commands that run Argon2id (vault create/unlock/change-password/recover,
 recovery-code regeneration, and encrypted export/import) are `async` Tauri
-commands. Tauri runs sync commands on the webview's main thread; a ~1s Argon2id
-derivation there would block rendering, freezing button spinners and loading
-state. Async commands run off the main thread, keeping the UI responsive.
+commands, as are the biometric commands (`biometric_enroll`/`biometric_unlock`/
+`biometric_disable`), since they perform AES-256-GCM wrap/unwrap and a
+Keychain round-trip that can block on the OS Touch ID/Face ID prompt. Tauri
+runs sync commands on the webview's main thread; blocking there would freeze
+rendering, button spinners, and loading state. Async commands run off the
+main thread, keeping the UI responsive.
 
 ---
 
@@ -135,11 +286,21 @@ state. Async commands run off the main thread, keeping the UI responsive.
 
 ### Engine
 
-`rusqlite` with the `bundled` feature (SQLite compiled into the binary). No external SQLite dependency.
+`rusqlite` with the `bundled-sqlcipher-vendored-openssl` feature: SQLite is
+compiled into the binary together with SQLCipher and a vendored OpenSSL for
+its crypto backend. No external SQLite/SQLCipher/OpenSSL dependency.
 
-The DB file is NOT encrypted at the file level (no SQLCipher). Instead, only secret values are encrypted (field-level encryption). Metadata (project names, secret keys, tags) is stored in plaintext in the DB.
+The DB file **is** encrypted at the file level (SQLCipher, raw-key mode keyed
+directly with the 32-byte master key — see "Full-Database Encryption
+(SQLCipher)" above). Project names, secret keys, descriptions, and tags are
+no longer plaintext on disk; the entire file is opaque ciphertext without the
+master key. `db::open` (unkeyed) is still used for reading legacy pre-v3
+plaintext vaults during migration; all normal operation goes through
+`db::open_keyed`.
 
-**Tradeoff acknowledged:** project names and secret key names are visible on disk without the master password. This is acceptable for v1 personal use. If this becomes a concern (team use, sensitive key names), we add SQLCipher in Phase 3.
+This closes the tradeoff previously accepted for v1/v2: metadata (project
+names, secret key names) is no longer visible on disk without the master
+password.
 
 ### Migrations
 
@@ -168,18 +329,23 @@ PRAGMA busy_timeout=5000;
 
 ### Session State
 
-Managed as Tauri application state:
+Managed as Tauri application state, a single mutex around the whole session
+(`src-tauri/src/state.rs`):
 
 ```rust
-pub struct VaultState {
-    pub key: Mutex<Option<Zeroizing<[u8; 32]>>>,
-    pub db:  Mutex<Option<Connection>>,
+pub struct Session {
+    pub db:   Option<Connection>,
+    pub key:  Option<Zeroizing<[u8; KEY_LEN]>>,
+    pub path: Option<PathBuf>,
 }
+pub struct VaultState(pub Mutex<Session>);
 ```
 
-- `key` is `None` when vault is locked
-- Every command that requires access calls a helper that returns `AppError::VaultLocked` if `key` is None
-- On `lock_vault`: key is zeroized via the `zeroize` crate before dropping
+- `key`/`db` are `None` when the vault is locked; `is_unlocked()` requires both.
+- Every command that requires access calls a helper (`db_and_key`/`db`) that
+  returns `AppError::VaultLocked` if the relevant field is `None`.
+- On `lock_vault`: `key` is set to `None`, which drops (and zeroizes, via
+  `Zeroizing`) the in-memory master key. The `db` connection is left open.
 
 ### Error Handling
 
@@ -188,20 +354,32 @@ pub struct VaultState {
 pub enum AppError {
     #[error("Vault is locked")]
     VaultLocked,
+    #[error("Vault already exists")]
+    VaultExists,
+    #[error("No vault found at the given path")]
+    VaultMissing,
     #[error("Wrong master password")]
     WrongPassword,
     #[error("Invalid recovery code")]
     WrongRecoveryCode,
     #[error("This vault has no recovery codes configured")]
     NoRecovery,
+    #[error("Too many attempts. Try again in {retry_after_secs}s.")]
+    RateLimited { retry_after_secs: u64 },
     #[error("Not found: {0}")]
     NotFound(String),
     #[error("Already exists: {0}")]
     AlreadyExists(String),
+    #[error("Invalid input: {0}")]
+    Invalid(String),
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("Crypto error: {0}")]
     Crypto(String),
+    #[error("IO error: {0}")]
+    Io(String),
+    #[error("This feature is not supported on this platform.")]
+    Unsupported,
 }
 
 // Tauri commands return Result<T, String>

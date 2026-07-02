@@ -54,35 +54,70 @@ secret-manager/
 
 ## Encryption Design
 
-**Never store the master password.** Only store:
-1. Argon2id parameters + salt (in `vault_meta` table, plaintext)
-2. A verification blob (to confirm correct password on unlock)
-3. All secret values encrypted with AES-256-GCM using the derived vault key
+**Never store the master password.** The vault database itself is encrypted at
+rest (full-DB SQLCipher, v3 — see below); pre-unlock metadata needed to derive
+the key lives in a plaintext sidecar file, `vault.meta.json`, next to the vault:
+1. Argon2id parameters + password salt + recovery salts (KDF inputs)
+2. The wrapped master key (password wrap + one wrap per recovery code)
+3. A verification blob (to confirm correct password on unlock without opening the DB)
+4. Rate-limit state (failed-attempt counter + backoff expiry)
+5. An optional macOS Touch ID wrap (see Biometric Unlock below)
 
-**Unlock flow (v2 envelope — current):**
+**Unlock flow (v3, current):**
 ```
 master_password + pw_salt → Argon2id → pw_key
 pw_key → AES-256-GCM decrypt master_wrap → master_key (32 bytes, in memory only)
-master_key → AES-256-GCM encrypt/decrypt each secret value on read/write
+master_key (hex) → SQLCipher raw key → PRAGMA key on the SQLite connection
 ```
-The master key is also wrapped by each single-use **recovery code**, so a code
-can reset the password without re-encrypting secrets. v1 vaults (direct
-`password → vault_key`) still unlock. Full detail in `docs/ARCHITECTURE.md`.
+Once keyed, the entire SQLite file — schema, project names, secret keys/tags,
+and secret values — is opaque ciphertext on disk; there is no plaintext
+metadata table anymore. The master key is also wrapped by each single-use
+**recovery code**, so a code can reset the password without re-encrypting
+anything. See `docs/ARCHITECTURE.md` for full detail on the sidecar, SQLCipher
+integration, legacy migration, rate limiting, and biometric unlock.
 
 **Argon2id parameters (minimum):**
 - `m_cost`: 65536 (64 MB)
 - `t_cost`: 3 iterations
 - `p_cost`: 4 parallelism
-- `salt`: 32 random bytes, generated once per vault, stored in `vault_meta`
+- `salt`: 32 random bytes, generated once per vault, stored in `vault.meta.json`
+
+**Rate limiting:** failed unlock attempts are counted and, past a threshold,
+gated by an exponential backoff (persisted in the sidecar so it survives app
+restarts). The backoff is temporary and capped — never a permanent lockout.
+
+**macOS Touch ID unlock:** a random token is stored in the macOS Keychain
+behind a biometric access-control policy (Secure Enclave); the sidecar holds
+`AES-256-GCM(token, master_key)`. Unlock triggers a Touch ID/Face ID prompt to
+release the token, which unwraps the master key. Not available on other
+platforms.
+
+**Legacy vault migration:** vaults created before v3 (plaintext SQLite with a
+`vault_meta` table) are migrated transparently on first unlock: the plaintext
+DB is read, verified, and re-exported into a new SQLCipher-encrypted file at
+the same path. The original plaintext file is kept as a one-time `<path>.bak`
+rather than deleted, so a failed/interrupted migration can't destroy data.
+That `.bak` is plaintext — treat it as sensitive; it is removed automatically
+if the vault is later deleted via `delete_vault`, but otherwise persists on
+disk until manually removed.
 
 ## Database Schema
+
+The `vault_meta` table below still exists inside the (now SQLCipher-encrypted)
+database, but it only tracks the internal schema/migration version
+(`db_version`) — the KDF/wrap/verify/rate-limit/biometric fields it used to
+hold pre-unlock now live in the plaintext `vault.meta.json` sidecar instead,
+since they must be readable *before* the master key is available to open the
+DB. Everything in this schema, including table/column names and all row data,
+is only readable once the DB is opened with the derived master key.
 
 ```sql
 CREATE TABLE vault_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
--- stores: argon2_salt (hex), argon2_params (json), verify_blob (hex), vault_version
+-- stores: db_version (schema/migration version only; KDF + wrap state moved
+-- to vault.meta.json in v3)
 
 CREATE TABLE projects (
   id          TEXT PRIMARY KEY,   -- UUIDv4
@@ -137,10 +172,21 @@ All commands are async. Errors return a string error message. The frontend calls
 | `vault_is_unlocked` | — | `bool` |
 | `get_vault_path` | — | `string \| null` |
 | `change_master_password` | `{ old_password: string, new_password: string }` | `void` |
+| `biometric_available` | — | `bool` (platform/device capability, macOS only) |
+| `biometric_enrolled` | `{ vault_path?: string }` | `bool` |
+| `biometric_enroll` | — | `void` (requires an unlocked vault) |
+| `biometric_unlock` | `{ vault_path?: string }` | `bool` (triggers Touch ID/Face ID prompt) |
+| `biometric_disable` | `{ vault_path?: string }` | `void` |
 
-> New vaults use envelope encryption (v2): a random master key encrypts secrets
-> and is wrapped by the password and by each recovery code. Unlock/recover/change
-> only re-wrap the master key. See `docs/ARCHITECTURE.md`.
+> Vaults use full-DB SQLCipher encryption (v3): a random master key encrypts
+> the entire SQLite file and is wrapped by the password and by each recovery
+> code, with pre-unlock state (KDF params, wraps, verify blob, rate-limit
+> counters, biometric wrap) held in a `vault.meta.json` sidecar next to the
+> vault. Unlock/recover/change only re-wrap the master key. `unlock_vault`
+> transparently migrates a legacy pre-v3 plaintext vault on first use (keeping
+> a `.bak`), and enforces exponential backoff after repeated failures (never a
+> permanent lockout — see `AppError::RateLimited { retry_after_secs }`).
+> See `docs/ARCHITECTURE.md`.
 
 ### Projects
 | Command | Args | Returns |
@@ -196,6 +242,19 @@ Default: OS-specific app data directory via Tauri's `app_data_dir()`.
 
 User can override via Settings → Custom vault path. Path stored in Tauri's app config.
 
+Alongside `vault.db` you may also find:
+- `vault.db.meta.json` — the sidecar (KDF params, wraps, verify blob,
+  rate-limit state, optional biometric wrap). Required to unlock; treat it as
+  part of the vault (back it up together with `vault.db`).
+- `vault.db.bak` — present only after a legacy vault was migrated to v3 on
+  unlock. This is the **original plaintext** database kept as a safety copy;
+  it is not needed for normal operation and is deleted automatically if the
+  vault is later removed via `delete_vault`. There is currently no dedicated
+  Settings action to remove just the `.bak` — delete it manually once you've
+  confirmed the migrated vault works, or leave it until the vault itself is
+  deleted.
+- `vault.db-wal` / `vault.db-shm` — normal SQLite WAL-mode files.
+
 ## Coding Conventions
 
 ### Rust
@@ -216,7 +275,7 @@ User can override via Settings → Custom vault path. Path stored in Tauri's app
 ```toml
 [dependencies]
 tauri = { version = "2", features = ["shell-open"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 ring = "0.17"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
@@ -225,7 +284,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 base64 = "0.22"
+security-framework = "3"   # macOS Keychain + biometric access control (Touch ID)
 ```
+
+`rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature compiles SQLCipher
+(and a vendored OpenSSL for its crypto) into the binary — this is what makes
+full-DB encryption (`db::open_keyed`, `PRAGMA key`) possible with no external
+SQLCipher/OpenSSL install required. `security-framework` is macOS-only in
+practice; `biometric.rs` compiles a no-op stub on other platforms.
+
+Frontend: `@zxcvbn-ts/core` (+ `language-common`/`language-en`) powers the password-strength meter
+(`src/lib/passwordStrength.ts`, `src/components/StrengthMeter.tsx`) shown on
+create/change/recover. It is advisory only — weak passwords are warned about,
+never blocked.
 
 ## Future: Team Sharing (Phase 3)
 
