@@ -86,11 +86,20 @@ fn build_recovery(
 
 /// Build a fresh v3 vault: random master key, sidecar (password wrap + recovery
 /// wraps + verify blob), and the one-time recovery codes. Does not touch disk.
+/// Uses the production default Argon2 parameters.
 pub fn create(password: &str) -> Result<([u8; KEY_LEN], Sidecar, Vec<String>)> {
+    create_with_params(password, Argon2Params::default())
+}
+
+/// Like [`create`] but with caller-supplied Argon2 parameters. Exists so tests
+/// can use cheap KDF params; production callers use [`create`].
+pub fn create_with_params(
+    password: &str,
+    params: Argon2Params,
+) -> Result<([u8; KEY_LEN], Sidecar, Vec<String>)> {
     if password.is_empty() {
         return Err(AppError::Invalid("master password must not be empty".into()));
     }
-    let params = Argon2Params::default();
     let master_key = {
         let bytes = crypto::random_bytes(KEY_LEN)?;
         let mut k = [0u8; KEY_LEN];
@@ -219,9 +228,16 @@ pub fn regenerate_recovery(
 mod tests {
     use super::*;
 
+    // Cheap KDF params so the suite doesn't pay the ~1s/64MB production cost per
+    // `create`. change_password/recover/regenerate read params from `sc.kdf`, so
+    // they inherit these automatically.
+    fn fast_params() -> Argon2Params {
+        Argon2Params { m_cost: 1024, t_cost: 1, p_cost: 1 }
+    }
+
     #[test]
     fn create_then_unlock_v2() {
-        let (k1, sc, codes) = create("hunter2").unwrap();
+        let (k1, sc, codes) = create_with_params("hunter2", fast_params()).unwrap();
         assert_eq!(codes.len(), RECOVERY_CODE_COUNT);
         let k2 = unlock(&sc, "hunter2").unwrap();
         assert_eq!(k1, k2);
@@ -229,13 +245,13 @@ mod tests {
 
     #[test]
     fn unlock_wrong_password_fails() {
-        let (_k, sc, _codes) = create("hunter2").unwrap();
+        let (_k, sc, _codes) = create_with_params("hunter2", fast_params()).unwrap();
         assert!(matches!(unlock(&sc, "wrong"), Err(AppError::WrongPassword)));
     }
 
     #[test]
     fn change_password_rewraps_same_master_key() {
-        let (key, mut sc, _codes) = create("old-pw").unwrap();
+        let (key, mut sc, _codes) = create_with_params("old-pw", fast_params()).unwrap();
         let new_key = change_password(&mut sc, "old-pw", "new-pw").unwrap();
         assert_eq!(new_key, key, "master key stable across password change");
         assert!(matches!(unlock(&sc, "old-pw"), Err(AppError::WrongPassword)));
@@ -244,7 +260,7 @@ mod tests {
 
     #[test]
     fn recover_with_code_resets_password() {
-        let (key, mut sc, codes) = create("forgotten").unwrap();
+        let (key, mut sc, codes) = create_with_params("forgotten", fast_params()).unwrap();
         let entered = codes[2].to_lowercase();
         let mk = recover(&mut sc, &entered, "brand-new-pw").unwrap();
         assert_eq!(mk, key);
@@ -254,7 +270,7 @@ mod tests {
 
     #[test]
     fn recover_with_bad_code_fails() {
-        let (_key, mut sc, _codes) = create("pw").unwrap();
+        let (_key, mut sc, _codes) = create_with_params("pw", fast_params()).unwrap();
         assert!(matches!(
             recover(&mut sc, "ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ", "new"),
             Err(AppError::WrongRecoveryCode)
@@ -263,12 +279,12 @@ mod tests {
 
     #[test]
     fn regenerate_recovery_invalidates_old_codes() {
-        let (key, mut sc, _old_codes) = create("pw").unwrap();
+        let (key, mut sc, _old_codes) = create_with_params("pw", fast_params()).unwrap();
         let new_codes = regenerate_recovery(&mut sc, &key).unwrap();
         assert_eq!(new_codes.len(), RECOVERY_CODE_COUNT);
         assert_eq!(recover(&mut sc, &new_codes[0], "pw2").unwrap(), key);
         // Re-fetch: after recover, sc is mutated; use a fresh vault for the old-code check.
-        let (k2, mut sc2, old2) = create("pw").unwrap();
+        let (k2, mut sc2, old2) = create_with_params("pw", fast_params()).unwrap();
         let regen = regenerate_recovery(&mut sc2, &k2).unwrap();
         assert!(!regen.is_empty());
         assert!(matches!(
