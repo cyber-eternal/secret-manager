@@ -248,6 +248,47 @@ pub fn recover(
     Err(AppError::WrongRecoveryCode)
 }
 
+// ---------------------------------------------------------------------------
+// Biometric wrap
+// ---------------------------------------------------------------------------
+
+/// Store `AES-GCM(token, master_key)` in the sidecar so a biometric-released
+/// token can recover the master key.
+pub fn wrap_master_for_biometric(
+    sc: &mut Sidecar,
+    master_key: &[u8; KEY_LEN],
+    token: &[u8; KEY_LEN],
+) -> Result<()> {
+    let wrap = crypto::encrypt(token, master_key)?;
+    sc.biometric_wrap = Some(hex::encode(wrap));
+    Ok(())
+}
+
+/// Recover the master key from the biometric wrap using `token`.
+pub fn unwrap_master_from_biometric(
+    sc: &Sidecar,
+    token: &[u8; KEY_LEN],
+) -> Result<[u8; KEY_LEN]> {
+    let hexed = sc.biometric_wrap.as_ref().ok_or(AppError::NoRecovery)?;
+    let wrap = hex::decode(hexed).map_err(|_| AppError::crypto("corrupt biometric wrap"))?;
+    let mk = crypto::decrypt(token, &wrap)?;
+    if mk.len() != KEY_LEN {
+        return Err(AppError::crypto("bad biometric wrap length"));
+    }
+    let mut arr = [0u8; KEY_LEN];
+    arr.copy_from_slice(&mk);
+    let verify = hex::decode(&sc.verify).map_err(|_| AppError::crypto("corrupt verify"))?;
+    if !crypto::verify_key(&arr, &verify) {
+        return Err(AppError::crypto("biometric wrap failed verification"));
+    }
+    Ok(arr)
+}
+
+/// Remove the biometric wrap from the sidecar.
+pub fn clear_biometric(sc: &mut Sidecar) {
+    sc.biometric_wrap = None;
+}
+
 /// Regenerate the recovery code set. Requires the unlocked master key.
 pub fn regenerate_recovery(
     sc: &mut Sidecar,
@@ -338,6 +379,21 @@ mod tests {
         record_success(&mut sc);
         assert_eq!(sc.failed_attempts, 0);
         assert_eq!(sc.locked_until_ms, 0);
+    }
+
+    #[test]
+    fn biometric_wrap_round_trips() {
+        let (key, mut sc, _c) = create_with_params("pw", fast_params()).unwrap();
+        let token = [7u8; KEY_LEN];
+        wrap_master_for_biometric(&mut sc, &key, &token).unwrap();
+        assert!(sc.biometric_wrap.is_some());
+        let got = unwrap_master_from_biometric(&sc, &token).unwrap();
+        assert_eq!(got, key);
+        // Wrong token fails.
+        let bad = [8u8; KEY_LEN];
+        assert!(unwrap_master_from_biometric(&sc, &bad).is_err());
+        clear_biometric(&mut sc);
+        assert!(sc.biometric_wrap.is_none());
     }
 
     #[test]
