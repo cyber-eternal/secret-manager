@@ -1,7 +1,7 @@
 //! Integration test: a vault on disk survives a "restart" (reopening the file)
 //! and secrets remain decryptable. Mirrors the Phase 1 acceptance criteria.
 
-use secret_manager_lib::{db, repo, vault};
+use secret_manager_lib::{db, repo, sidecar::Sidecar, vault};
 
 #[test]
 fn vault_persists_across_reopen() {
@@ -14,8 +14,9 @@ fn vault_persists_across_reopen() {
 
     // --- First "session": create vault, add data ---
     {
-        let conn = db::open(&path).unwrap();
-        let (key, _codes) = vault::create(&conn, "master-pw").unwrap();
+        let (key, sc, _codes) = vault::create("master-pw").unwrap();
+        let conn = db::open_keyed(&path, &vault::key_hex(&key)).unwrap();
+        sc.save(&path).unwrap();
         let p = repo::create_project(&conn, "backend", Some("api server")).unwrap();
         let s = repo::add_secret(
             &conn,
@@ -33,13 +34,14 @@ fn vault_persists_across_reopen() {
 
     // --- Second "session": reopen the same file, unlock, read back ---
     {
-        let conn = db::open(&path).unwrap();
-        assert!(vault::is_initialized(&conn).unwrap());
+        assert!(Sidecar::exists(&path));
+        let sc = Sidecar::load(&path).unwrap();
 
         // Wrong password is rejected.
-        assert!(vault::unlock(&conn, "nope").is_err());
+        assert!(vault::unlock(&sc, "nope").is_err());
 
-        let key = vault::unlock(&conn, "master-pw").unwrap();
+        let key = vault::unlock(&sc, "master-pw").unwrap();
+        let conn = db::open_keyed(&path, &vault::key_hex(&key)).unwrap();
 
         let projects = repo::list_projects(&conn).unwrap();
         assert_eq!(projects.len(), 1);

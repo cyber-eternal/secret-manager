@@ -12,11 +12,18 @@ use crate::{db, vault};
 #[tauri::command]
 pub fn vault_exists(app: AppHandle, vault_path: Option<String>) -> Result<bool> {
     let path = resolve_vault_path(&app, vault_path)?;
-    if !path.exists() {
+    Ok(crate::sidecar::Sidecar::exists(&path) || path.exists())
+}
+
+/// Whether the vault at the resolved path has recovery codes configured.
+#[tauri::command]
+pub fn vault_has_recovery(app: AppHandle, vault_path: Option<String>) -> Result<bool> {
+    let path = resolve_vault_path(&app, vault_path)?;
+    if !crate::sidecar::Sidecar::exists(&path) {
         return Ok(false);
     }
-    let conn = db::open(&path)?;
-    vault::is_initialized(&conn)
+    let sc = crate::sidecar::Sidecar::load(&path)?;
+    Ok(crate::vault::has_recovery(&sc))
 }
 
 /// Create a new vault and leave it unlocked. Returns the one-time recovery codes
@@ -33,8 +40,12 @@ pub async fn create_vault(
     vault_path: Option<String>,
 ) -> Result<Vec<String>> {
     let path = resolve_vault_path(&app, vault_path)?;
-    let conn = db::open(&path)?;
-    let (key, codes) = vault::create(&conn, &password)?;
+    if crate::sidecar::Sidecar::exists(&path) || path.exists() {
+        return Err(AppError::VaultExists);
+    }
+    let (key, sc, codes) = vault::create(&password)?;
+    let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
+    sc.save(&path)?;
 
     let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
     session.db = Some(conn);
@@ -43,15 +54,39 @@ pub async fn create_vault(
     Ok(codes)
 }
 
-/// Whether the vault at the resolved path has recovery codes configured.
+/// Unlock an existing vault. Returns `true` on success. Transparently migrates a
+/// legacy plaintext vault to the encrypted v3 format on first unlock.
 #[tauri::command]
-pub fn vault_has_recovery(app: AppHandle, vault_path: Option<String>) -> Result<bool> {
+pub async fn unlock_vault(
+    app: AppHandle,
+    state: State<'_, VaultState>,
+    password: String,
+    vault_path: Option<String>,
+) -> Result<bool> {
     let path = resolve_vault_path(&app, vault_path)?;
-    if !path.exists() {
-        return Ok(false);
+    let sidecar_exists = crate::sidecar::Sidecar::exists(&path);
+    if !sidecar_exists && !path.exists() {
+        return Err(AppError::VaultMissing);
     }
-    let conn = db::open(&path)?;
-    vault::has_recovery(&conn)
+
+    let (key, conn) = if sidecar_exists {
+        let sc = crate::sidecar::Sidecar::load(&path)?;
+        let key = vault::unlock(&sc, &password)?;
+        let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
+        (key, conn)
+    } else {
+        // Legacy plaintext DB: migrate in place.
+        let (key, sc) = crate::migrate::migrate_plaintext_to_encrypted(&path, &password)?;
+        sc.save(&path)?;
+        let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
+        (key, conn)
+    };
+
+    let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
+    session.db = Some(conn);
+    session.key = Some(Zeroizing::new(key));
+    session.path = Some(path);
+    Ok(true)
 }
 
 /// Recover a vault using a recovery code and set a new master password. Leaves
@@ -65,11 +100,13 @@ pub async fn recover_vault(
     vault_path: Option<String>,
 ) -> Result<()> {
     let path = resolve_vault_path(&app, vault_path)?;
-    if !path.exists() {
-        return Err(AppError::VaultMissing);
+    if !crate::sidecar::Sidecar::exists(&path) {
+        return Err(AppError::NoRecovery);
     }
-    let conn = db::open(&path)?;
-    let key = vault::recover(&conn, &code, &new_password)?;
+    let mut sc = crate::sidecar::Sidecar::load(&path)?;
+    let key = vault::recover(&mut sc, &code, &new_password)?;
+    sc.save(&path)?;
+    let conn = db::open_keyed(&path, &vault::key_hex(&key))?;
 
     let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
     session.db = Some(conn);
@@ -82,13 +119,19 @@ pub async fn recover_vault(
 /// working. Returns the new one-time codes.
 #[tauri::command]
 pub async fn regenerate_recovery_codes(state: State<'_, VaultState>) -> Result<Vec<String>> {
-    let session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
-    let (db, key) = session.db_and_key()?;
-    vault::regenerate_recovery(db, key)
+    let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
+    let key = *session.key.as_ref().ok_or(AppError::VaultLocked)?.clone();
+    let path = session.path.clone().ok_or(AppError::VaultLocked)?;
+    let mut sc = crate::sidecar::Sidecar::load(&path)?;
+    let codes = vault::regenerate_recovery(&mut sc, &key)?;
+    sc.save(&path)?;
+    let _ = &mut session; // keep the guard alive
+    Ok(codes)
 }
 
-/// Permanently delete the vault file (and its WAL/SHM sidecars). Used as a last
-/// resort when the master password is lost and no recovery code is available.
+/// Permanently delete the vault file (and its WAL/SHM/backup/sidecar files). Used
+/// as a last resort when the master password is lost and no recovery code is
+/// available.
 #[tauri::command]
 pub fn delete_vault(
     app: AppHandle,
@@ -105,7 +148,7 @@ pub fn delete_vault(
         session.path = None;
     }
 
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", ".bak", ".meta.json"] {
         let p = if suffix.is_empty() {
             path.clone()
         } else {
@@ -116,28 +159,6 @@ pub fn delete_vault(
         }
     }
     Ok(())
-}
-
-/// Unlock an existing vault. Returns `true` on success.
-#[tauri::command]
-pub async fn unlock_vault(
-    app: AppHandle,
-    state: State<'_, VaultState>,
-    password: String,
-    vault_path: Option<String>,
-) -> Result<bool> {
-    let path = resolve_vault_path(&app, vault_path)?;
-    if !path.exists() {
-        return Err(AppError::VaultMissing);
-    }
-    let conn = db::open(&path)?;
-    let key = vault::unlock(&conn, &password)?;
-
-    let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
-    session.db = Some(conn);
-    session.key = Some(Zeroizing::new(key));
-    session.path = Some(path);
-    Ok(true)
 }
 
 /// Lock the vault: zeroize the key. The DB connection stays open.
@@ -168,8 +189,10 @@ pub async fn change_master_password(
     new_password: String,
 ) -> Result<()> {
     let mut session = state.0.lock().map_err(|_| AppError::Io("state poisoned".into()))?;
-    let conn = session.db.as_mut().ok_or(AppError::VaultLocked)?;
-    let new_key = vault::change_password(conn, &old_password, &new_password)?;
+    let path = session.path.clone().ok_or(AppError::VaultLocked)?;
+    let mut sc = crate::sidecar::Sidecar::load(&path)?;
+    let new_key = vault::change_password(&mut sc, &old_password, &new_password)?;
+    sc.save(&path)?;
     session.key = Some(Zeroizing::new(new_key));
     Ok(())
 }
