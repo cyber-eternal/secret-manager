@@ -1,18 +1,23 @@
 // Full-screen gate: create vault (first run), unlock, or recover with a code.
 
 import { useEffect, useState, type FormEvent } from "react";
-import { KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
+import { Fingerprint, KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
 import { Button, Input, PasswordInput } from "./ui/controls";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { StrengthMeter } from "./StrengthMeter";
 import { estimateStrength, isWeak } from "../lib/passwordStrength";
 import { useVault } from "../store/vault";
 import { errMessage, validateMasterPassword } from "../lib/utils";
+import {
+  biometricAvailable as api_biometricAvailable,
+  biometricEnrolled as api_biometricEnrolled,
+} from "../lib/tauri";
 
 type Mode = "auth" | "recover";
 
 export function UnlockScreen() {
-  const { hasVault, unlock, createVault, recover, resetVault, busy } = useVault();
+  const { hasVault, unlock, createVault, recover, resetVault, busy, biometricUnlock } =
+    useVault();
   const [mode, setMode] = useState<Mode>("auth");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -21,6 +26,7 @@ export function UnlockScreen() {
   const [showReset, setShowReset] = useState(false);
   const [weakAck, setWeakAck] = useState(false);
   const [lockedFor, setLockedFor] = useState(0);
+  const [bioReady, setBioReady] = useState(false);
 
   const firstRun = !hasVault;
 
@@ -29,6 +35,13 @@ export function UnlockScreen() {
     const t = setInterval(() => setLockedFor((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(t);
   }, [lockedFor]);
+
+  useEffect(() => {
+    if (firstRun) return;
+    Promise.all([api_biometricAvailable(), api_biometricEnrolled()])
+      .then(([a, e]) => setBioReady(a && e))
+      .catch(() => setBioReady(false));
+  }, [firstRun]);
 
   const resetFields = () => {
     setPassword("");
@@ -166,6 +179,25 @@ export function UnlockScreen() {
                 </>
               )}
             </Button>
+
+            {!firstRun && bioReady && (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={async () => {
+                  setError(null);
+                  try {
+                    await biometricUnlock();
+                    resetFields();
+                  } catch (err) {
+                    setError(errMessage(err));
+                  }
+                }}
+                className="mt-3 w-full"
+              >
+                <Fingerprint className="h-4 w-4" /> Unlock with Touch ID
+              </Button>
+            )}
 
             {!firstRun && (
               <button

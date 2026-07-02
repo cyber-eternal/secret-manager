@@ -46,6 +46,20 @@ export const getVaultPath = () => invoke<string | null>("get_vault_path");
 export const changeMasterPassword = (oldPassword: string, newPassword: string) =>
   invoke<void>("change_master_password", { oldPassword, newPassword });
 
+export const biometricAvailable = () =>
+  invoke<boolean>("biometric_available");
+
+export const biometricEnrolled = (vaultPath?: string) =>
+  invoke<boolean>("biometric_enrolled", { vaultPath });
+
+export const biometricEnroll = () => invoke<void>("biometric_enroll");
+
+export const biometricUnlock = (vaultPath?: string) =>
+  invoke<boolean>("biometric_unlock", { vaultPath });
+
+export const biometricDisable = (vaultPath?: string) =>
+  invoke<void>("biometric_disable", { vaultPath });
+
 // ---- Projects ----
 export const createProject = (name: string, description?: string | null) =>
   invoke<Project>("create_project", { name, description: description ?? null });

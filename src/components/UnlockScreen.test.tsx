@@ -14,6 +14,11 @@ vi.mock("../lib/tauri", () => ({
   createProject: vi.fn(),
   updateProject: vi.fn(),
   deleteProject: vi.fn(),
+  biometricAvailable: vi.fn(async () => false),
+  biometricEnrolled: vi.fn(async () => false),
+  biometricUnlock: vi.fn(async () => true),
+  biometricDisable: vi.fn(async () => {}),
+  biometricEnroll: vi.fn(async () => {}),
 }));
 
 import { UnlockScreen } from "./UnlockScreen";

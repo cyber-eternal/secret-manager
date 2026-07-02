@@ -8,6 +8,10 @@ import { Dialog } from "../components/ui/Dialog";
 import { RecoveryCodes } from "../components/RecoveryCodes";
 import { StrengthMeter } from "../components/StrengthMeter";
 import {
+  biometricAvailable,
+  biometricDisable,
+  biometricEnroll,
+  biometricEnrolled,
   changeMasterPassword,
   getVaultPath,
   regenerateRecoveryCodes,
@@ -64,9 +68,20 @@ export function Settings() {
   const [codesBusy, setCodesBusy] = useState(false);
   const [codesErr, setCodesErr] = useState<string | null>(null);
 
+  // biometric (Touch ID) unlock
+  const [bioAvail, setBioAvail] = useState(false);
+  const [bioOn, setBioOn] = useState(false);
+
   useEffect(() => {
     getVaultPath().then(setVaultPath).catch(() => setVaultPath(null));
   }, []);
+
+  useEffect(() => {
+    biometricAvailable().then(setBioAvail).catch(() => setBioAvail(false));
+    biometricEnrolled(settings.customVaultPath ?? undefined)
+      .then(setBioOn)
+      .catch(() => setBioOn(false));
+  }, [settings.customVaultPath]);
 
   const submitPw = async (e: FormEvent) => {
     e.preventDefault();
@@ -162,6 +177,37 @@ export function Settings() {
               Change password
             </Button>
           </form>
+
+          {bioAvail && (
+            <div className="flex items-center justify-between border-t border-border pt-4">
+              <div>
+                <p className="text-[13px] text-text">Unlock with Touch ID</p>
+                <p className="text-[11.5px] text-text-muted">
+                  Store an unlock token in the macOS Keychain, protected by your
+                  fingerprint.
+                </p>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    if (bioOn) {
+                      await biometricDisable(settings.customVaultPath ?? undefined);
+                      setBioOn(false);
+                    } else {
+                      await biometricEnroll();
+                      setBioOn(true);
+                    }
+                  } catch (err) {
+                    setPwMsg({ ok: false, text: errMessage(err) });
+                  }
+                }}
+              >
+                {bioOn ? "Disable" : "Enable"}
+              </Button>
+            </div>
+          )}
         </Section>
 
         <Section title="Recovery codes">
