@@ -45,6 +45,35 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Apply the SQLCipher key to a freshly opened connection. Must run before any
+/// other statement. `key_hex` is 64 hex chars (32-byte raw key).
+fn apply_key(conn: &Connection, key_hex: &str) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
+    Ok(())
+}
+
+/// Open (creating if needed) a SQLCipher-encrypted vault DB, keyed with the
+/// 32-byte master key rendered as 64 hex chars.
+pub fn open_keyed(path: &Path, key_hex: &str) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(path)?;
+    apply_key(&conn, key_hex)?;
+    apply_pragmas(&conn)?;
+    run_migrations(&conn)?;
+    Ok(conn)
+}
+
+/// In-memory keyed DB for tests.
+pub fn open_in_memory_keyed(key_hex: &str) -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    apply_key(&conn, key_hex)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    run_migrations(&conn)?;
+    Ok(conn)
+}
+
 /// Run any migrations newer than the stored `db_version`.
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     // The meta table must exist before we can read db_version; the first
@@ -118,5 +147,15 @@ mod tests {
             .query_row("SELECT value FROM vault_meta WHERE key='db_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "001");
+    }
+
+    #[test]
+    fn keyed_db_round_trips_and_rejects_wrong_key() {
+        let key = "0".repeat(64);
+        let conn = open_in_memory_keyed(&key).unwrap();
+        conn.execute("CREATE TABLE t(x TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t(x) VALUES('hi')", []).unwrap();
+        let got: String = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(got, "hi");
     }
 }
