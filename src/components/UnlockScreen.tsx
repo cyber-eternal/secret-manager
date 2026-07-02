@@ -4,6 +4,8 @@ import { useState, type FormEvent } from "react";
 import { KeyRound, LifeBuoy, Lock, ShieldPlus } from "lucide-react";
 import { Button, Input, PasswordInput } from "./ui/controls";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { StrengthMeter } from "./StrengthMeter";
+import { estimateStrength, isWeak } from "../lib/passwordStrength";
 import { useVault } from "../store/vault";
 import { errMessage, validateMasterPassword } from "../lib/utils";
 
@@ -17,6 +19,7 @@ export function UnlockScreen() {
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showReset, setShowReset] = useState(false);
+  const [weakAck, setWeakAck] = useState(false);
 
   const firstRun = !hasVault;
 
@@ -25,6 +28,7 @@ export function UnlockScreen() {
     setConfirm("");
     setCode("");
     setError(null);
+    setWeakAck(false);
   };
 
   const onAuthSubmit = async (e: FormEvent) => {
@@ -34,6 +38,10 @@ export function UnlockScreen() {
       if (firstRun) {
         const check = validateMasterPassword(password, confirm);
         if (!check.ok) return setError(check.message ?? "Invalid password");
+        if (isWeak(estimateStrength(password).score) && !weakAck) {
+          setWeakAck(true);
+          return setError("That password is weak. Click Create vault again to use it anyway.");
+        }
         await createVault(password);
       } else {
         if (!password) return setError("Enter your master password.");
@@ -51,6 +59,10 @@ export function UnlockScreen() {
     if (!code.trim()) return setError("Enter a recovery code.");
     const check = validateMasterPassword(password, confirm);
     if (!check.ok) return setError(check.message ?? "Invalid password");
+    if (isWeak(estimateStrength(password).score) && !weakAck) {
+      setWeakAck(true);
+      return setError("That password is weak. Click Recover access again to use it anyway.");
+    }
     try {
       await recover(code.trim(), password);
       resetFields();
@@ -118,6 +130,7 @@ export function UnlockScreen() {
                 />
               </>
             )}
+            {firstRun && <StrengthMeter password={password} />}
 
             {error && (
               <p className="mt-3 text-[12.5px] text-danger" role="alert">
@@ -179,6 +192,7 @@ export function UnlockScreen() {
               placeholder="••••••••"
               className="font-mono"
             />
+            <StrengthMeter password={password} />
 
             {error && (
               <p className="mt-3 text-[12.5px] text-danger" role="alert">

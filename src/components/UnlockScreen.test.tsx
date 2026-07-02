@@ -52,11 +52,37 @@ describe("UnlockScreen first-run", () => {
     const user = userEvent.setup();
     render(<UnlockScreen />);
     const fields = screen.getAllByPlaceholderText("••••••••");
-    await user.type(fields[0], "supersecret");
-    await user.type(fields[1], "supersecret");
+    await user.type(fields[0], "correct-horse-battery-staple-92xQ");
+    await user.type(fields[1], "correct-horse-battery-staple-92xQ");
     await user.click(screen.getByRole("button", { name: /create vault/i }));
 
-    await waitFor(() => expect(api.createVault).toHaveBeenCalledWith("supersecret", undefined));
+    await waitFor(() =>
+      expect(api.createVault).toHaveBeenCalledWith(
+        "correct-horse-battery-staple-92xQ",
+        undefined,
+      ),
+    );
+  });
+
+  it("warns on a weak password, then creates it on a second click", async () => {
+    const user = userEvent.setup();
+    render(<UnlockScreen />);
+    const fields = screen.getAllByPlaceholderText("••••••••");
+    await user.type(fields[0], "supersecret");
+    await user.type(fields[1], "supersecret");
+
+    // First click: weak-password gate warns and does NOT create the vault.
+    await user.click(screen.getByRole("button", { name: /create vault/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/weak.*again/i),
+    );
+    expect(api.createVault).not.toHaveBeenCalled();
+
+    // Second click: acknowledgement accepted, vault is created anyway.
+    await user.click(screen.getByRole("button", { name: /create vault/i }));
+    await waitFor(() =>
+      expect(api.createVault).toHaveBeenCalledWith("supersecret", undefined),
+    );
   });
 });
 
@@ -101,14 +127,14 @@ describe("UnlockScreen unlock", () => {
       "AAAAA-BBBBB",
     );
     const pwFields = screen.getAllByPlaceholderText("••••••••");
-    await user.type(pwFields[0], "brandnewpw");
-    await user.type(pwFields[1], "brandnewpw");
+    await user.type(pwFields[0], "correct-horse-battery-staple-92xQ");
+    await user.type(pwFields[1], "correct-horse-battery-staple-92xQ");
     await user.click(screen.getByRole("button", { name: /recover access/i }));
 
     await waitFor(() =>
       expect(api.recoverVault).toHaveBeenCalledWith(
         "AAAAA-BBBBB",
-        "brandnewpw",
+        "correct-horse-battery-staple-92xQ",
         undefined,
       ),
     );
