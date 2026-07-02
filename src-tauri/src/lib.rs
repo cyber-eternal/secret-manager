@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod repo;
+pub mod sidecar;
 pub mod state;
 pub mod transfer;
 pub mod vault;
