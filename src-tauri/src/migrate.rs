@@ -25,11 +25,15 @@ pub fn migrate_plaintext_to_encrypted(
         std::fs::remove_file(&new_path).ok();
     }
     let key_hex = vault::key_hex(&master_key);
+    // The path goes into a single-quoted SQL literal; escape any embedded single
+    // quote by doubling it so a quote in the vault path can't break out of the
+    // literal. `key_hex` is hex-only and needs no escaping.
+    let esc_path = new_path.display().to_string().replace('\'', "''");
     conn.execute_batch(&format!(
         "ATTACH DATABASE '{}' AS enc KEY \"x'{}'\";
          SELECT sqlcipher_export('enc');
          DETACH DATABASE enc;",
-        new_path.display(),
+        esc_path,
         key_hex,
     ))?;
     drop(conn);
@@ -39,11 +43,11 @@ pub fn migrate_plaintext_to_encrypted(
     std::fs::rename(db_path, &bak).map_err(|e| AppError::Io(e.to_string()))?;
     std::fs::rename(&new_path, db_path).map_err(|e| AppError::Io(e.to_string()))?;
 
-    // Verify the encrypted DB opens with the master key.
+    // Verify the exported encrypted DB is structurally sound: propagate an error
+    // if it can't be opened with the master key or the read fails, rather than
+    // leaving a corrupt file silently in place.
     let check = db::open_keyed(db_path, &key_hex)?;
-    check
-        .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()))
-        .ok();
+    check.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()))?;
     Ok((master_key, sc))
 }
 
@@ -159,6 +163,31 @@ mod tests {
         master_key
     }
 
+    fn write_legacy_v1_plaintext(path: &Path, password: &str) -> [u8; KEY_LEN] {
+        // Build a legacy v1 plaintext DB: key derived DIRECTLY from the password
+        // (no envelope / master_wrap). Secrets are field-encrypted under that
+        // derived key, so the derived key IS the effective master key.
+        let conn = db::open(path).unwrap();
+        let params = Argon2Params { m_cost: 1024, t_cost: 1, p_cost: 1 };
+        let salt = crypto::generate_salt().unwrap();
+        let key = crypto::derive_key(password, &salt, &params).unwrap();
+        let verify = crypto::make_verify_blob(&key).unwrap();
+        let set = |k: &str, v: &str| {
+            conn.execute(
+                "INSERT INTO vault_meta(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [k, v]).unwrap();
+        };
+        set("vault_version", "1");
+        set("argon2_salt", &hex::encode(salt));
+        set("argon2_params", &serde_json::to_string(&params).unwrap());
+        set("verify_blob", &hex::encode(&verify));
+        // Deliberately NO master_wrap row — that is what marks this as v1.
+        let proj = crate::repo::create_project(&conn, "p", None).unwrap();
+        crate::repo::add_secret(&conn, &key, &proj.id, "K", "v", None, &[]).unwrap();
+        key
+    }
+
     #[test]
     fn migrates_and_preserves_secret() {
         let dir = std::env::temp_dir().join(format!("smmig-{}", uuid::Uuid::new_v4()));
@@ -180,6 +209,31 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_and_preserves_secret() {
+        let dir = std::env::temp_dir().join(format!("smmig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("vault.db");
+        let derived_key = write_legacy_v1_plaintext(&db, "pw123456");
+
+        let (mk, sc) = migrate_plaintext_to_encrypted(&db, "pw123456").unwrap();
+        // v1 uses the password-derived key AS the master key; a fresh random key
+        // would orphan the field-encrypted secrets.
+        assert_eq!(mk, derived_key, "v1 derived key becomes master key");
+        assert_eq!(sc.version, 3);
+        assert!(dir.join("vault.db.bak").exists(), "backup kept");
+
+        // Open the encrypted DB and confirm the secret's VALUE still decrypts —
+        // this only works if the master key equals the original field key.
+        sc.save(&db).unwrap();
+        let conn = db::open_keyed(&db, &vault::key_hex(&mk)).unwrap();
+        let proj = crate::repo::get_project_by_name(&conn, "p").unwrap().unwrap();
+        let id = crate::repo::get_secret_id_by_key(&conn, &proj.id, "K").unwrap().unwrap();
+        let secret = crate::repo::get_secret(&conn, &mk, &id).unwrap();
+        assert_eq!(secret.value, "v", "v1 secret value round-trips after migration");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn wrong_password_does_not_migrate() {
         let dir = std::env::temp_dir().join(format!("smmig-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -188,5 +242,32 @@ mod tests {
         assert!(migrate_plaintext_to_encrypted(&db, "wrong-pw").is_err());
         assert!(!dir.join("vault.db.bak").exists(), "no swap on failure");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_when_path_contains_single_quote() {
+        // A vault path with a single quote must not break the ATTACH SQL literal.
+        let dir = std::env::temp_dir().join(format!("smmig-'x-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("vault.db");
+        let original_key = write_legacy_v2_plaintext(&db, "pw123456");
+
+        let (mk, sc) = migrate_plaintext_to_encrypted(&db, "pw123456").unwrap();
+        assert_eq!(mk, original_key);
+        assert_eq!(sc.version, 3);
+
+        sc.save(&db).unwrap();
+        let conn = db::open_keyed(&db, &vault::key_hex(&mk)).unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_quote_escaping_doubles_quotes() {
+        // Unit-level guard for the SQL-literal escaping used in the ATTACH clause.
+        assert_eq!("a'b".replace('\'', "''"), "a''b");
+        assert_eq!("'".replace('\'', "''"), "''");
+        assert_eq!("no-quote".replace('\'', "''"), "no-quote");
     }
 }
