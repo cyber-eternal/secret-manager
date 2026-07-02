@@ -1,5 +1,6 @@
 //! secret-manager Tauri backend library.
 
+pub mod biometric;
 pub mod commands;
 pub mod crypto;
 pub mod db;

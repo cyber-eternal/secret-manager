@@ -41,6 +41,9 @@ pub enum AppError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    #[error("This feature is not supported on this platform.")]
+    Unsupported,
 }
 
 impl AppError {
