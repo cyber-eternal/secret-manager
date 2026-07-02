@@ -6,6 +6,7 @@ import { Download, FolderOpen, KeyRound, Upload } from "lucide-react";
 import { Button, Input, PasswordInput } from "../components/ui/controls";
 import { Dialog } from "../components/ui/Dialog";
 import { RecoveryCodes } from "../components/RecoveryCodes";
+import { StrengthMeter } from "../components/StrengthMeter";
 import {
   changeMasterPassword,
   getVaultPath,
@@ -132,6 +133,7 @@ export function Settings() {
                 onChange={(e) => setNewPw(e.target.value)}
                 className="font-mono"
               />
+              <StrengthMeter password={newPw} />
             </div>
             <div>
               <label className="section-label mb-1.5 block">Confirm new password</label>
