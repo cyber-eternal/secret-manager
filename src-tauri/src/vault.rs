@@ -24,72 +24,23 @@
 //! without Tauri.
 
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, Argon2Params, KEY_LEN};
 use crate::db::now_ms;
 use crate::error::{AppError, Result};
-
-// Shared meta keys.
-const META_VERIFY: &str = "verify_blob";
-const META_VAULT_VERSION: &str = "vault_version";
-
-// v2 meta keys.
-const META_KDF: &str = "kdf_params";
-const META_PW_SALT: &str = "pw_salt";
-const META_MASTER_WRAP: &str = "master_wrap";
-const META_RECOVERY: &str = "recovery";
+use crate::sidecar::{RecoveryEntry, Sidecar};
 
 // v1 (legacy) meta keys.
+const META_VERIFY: &str = "verify_blob";
 const META_SALT_LEGACY: &str = "argon2_salt";
 const META_PARAMS_LEGACY: &str = "argon2_params";
 
 /// Number of recovery codes generated per set.
 pub const RECOVERY_CODE_COUNT: usize = 8;
 
-#[derive(Serialize, Deserialize)]
-struct RecoveryEntry {
-    salt: String, // hex
-    wrap: String, // hex: AES-GCM(code_key, master_key)
-}
-
-fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
-    let v: Option<String> = conn
-        .query_row("SELECT value FROM vault_meta WHERE key = ?1", [key], |r| r.get(0))
-        .ok();
-    Ok(v)
-}
-
-fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO vault_meta(key, value) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [key, value],
-    )?;
-    Ok(())
-}
-
-/// `true` once a vault has been created (either format).
-pub fn is_initialized(conn: &Connection) -> Result<bool> {
-    let v2 = meta_get(conn, META_MASTER_WRAP)?.is_some();
-    let v1 = meta_get(conn, META_SALT_LEGACY)?.is_some()
-        && meta_get(conn, META_VERIFY)?.is_some();
-    Ok(v2 || v1)
-}
-
-/// `true` if this vault has recovery codes configured (v2 only).
-pub fn has_recovery(conn: &Connection) -> Result<bool> {
-    match meta_get(conn, META_RECOVERY)? {
-        Some(json) => {
-            let list: Vec<RecoveryEntry> = serde_json::from_str(&json).unwrap_or_default();
-            Ok(!list.is_empty())
-        }
-        None => Ok(false),
-    }
-}
-
-fn is_v2(conn: &Connection) -> Result<bool> {
-    Ok(meta_get(conn, META_MASTER_WRAP)?.is_some())
+/// Render a 32-byte master key as 64 lowercase hex chars for `PRAGMA key`.
+pub fn key_hex(master_key: &[u8; KEY_LEN]) -> String {
+    hex::encode(master_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -119,11 +70,11 @@ fn normalize_code(code: &str) -> String {
 }
 
 /// Build the stored recovery wraps for a fresh set of codes. Returns the
-/// plaintext codes (to show the user once) and the serialized wrap list.
+/// plaintext codes (to show the user once) and the wrap entries.
 fn build_recovery(
     master_key: &[u8; KEY_LEN],
     params: &Argon2Params,
-) -> Result<(Vec<String>, String)> {
+) -> Result<(Vec<String>, Vec<RecoveryEntry>)> {
     let mut codes = Vec::with_capacity(RECOVERY_CODE_COUNT);
     let mut entries = Vec::with_capacity(RECOVERY_CODE_COUNT);
     for _ in 0..RECOVERY_CODE_COUNT {
@@ -131,29 +82,22 @@ fn build_recovery(
         let salt = crypto::generate_salt()?;
         let code_key = crypto::derive_key(&normalize_code(&code), &salt, params)?;
         let wrap = crypto::encrypt(&code_key, master_key)?;
-        entries.push(RecoveryEntry {
-            salt: hex::encode(salt),
-            wrap: hex::encode(wrap),
-        });
+        entries.push(RecoveryEntry { salt: hex::encode(salt), wrap: hex::encode(wrap) });
         codes.push(code);
     }
-    Ok((codes, serde_json::to_string(&entries)?))
+    Ok((codes, entries))
 }
 
 // ---------------------------------------------------------------------------
 // Create / unlock / change password / recover
 // ---------------------------------------------------------------------------
 
-/// Create a new v2 vault. Returns the master key plus the freshly generated
-/// recovery codes (shown to the user exactly once).
-pub fn create(conn: &Connection, password: &str) -> Result<([u8; KEY_LEN], Vec<String>)> {
+/// Build a fresh v3 vault: random master key, sidecar (password wrap + recovery
+/// wraps + verify blob), and the one-time recovery codes. Does not touch disk.
+pub fn create(password: &str) -> Result<([u8; KEY_LEN], Sidecar, Vec<String>)> {
     if password.is_empty() {
         return Err(AppError::Invalid("master password must not be empty".into()));
     }
-    if is_initialized(conn)? {
-        return Err(AppError::VaultExists);
-    }
-
     let params = Argon2Params::default();
     let master_key = {
         let bytes = crypto::random_bytes(KEY_LEN)?;
@@ -161,53 +105,47 @@ pub fn create(conn: &Connection, password: &str) -> Result<([u8; KEY_LEN], Vec<S
         k.copy_from_slice(&bytes);
         k
     };
-
     let pw_salt = crypto::generate_salt()?;
     let pw_key = crypto::derive_key(password, &pw_salt, &params)?;
     let master_wrap = crypto::encrypt(&pw_key, &master_key)?;
     let verify = crypto::make_verify_blob(&master_key)?;
-    let (codes, recovery_json) = build_recovery(&master_key, &params)?;
+    let (codes, entries) = build_recovery(&master_key, &params)?;
 
-    meta_set(conn, META_VAULT_VERSION, "2")?;
-    meta_set(conn, META_KDF, &serde_json::to_string(&params)?)?;
-    meta_set(conn, META_PW_SALT, &hex::encode(pw_salt))?;
-    meta_set(conn, META_MASTER_WRAP, &hex::encode(&master_wrap))?;
-    meta_set(conn, META_VERIFY, &hex::encode(&verify))?;
-    meta_set(conn, META_RECOVERY, &recovery_json)?;
-
-    Ok((master_key, codes))
+    let sc = Sidecar {
+        format: "secret-manager-meta".into(),
+        version: 3,
+        kdf: params,
+        pw_salt: hex::encode(pw_salt),
+        master_wrap: hex::encode(&master_wrap),
+        verify: hex::encode(&verify),
+        recovery: entries,
+        failed_attempts: 0,
+        locked_until_ms: 0,
+        biometric_wrap: None,
+    };
+    Ok((master_key, sc, codes))
 }
 
-/// Unlock a vault with the master password. Works for v2 (envelope) and v1
-/// (legacy direct-derivation) formats.
-pub fn unlock(conn: &Connection, password: &str) -> Result<[u8; KEY_LEN]> {
-    if is_v2(conn)? {
-        let params: Argon2Params =
-            serde_json::from_str(&meta_get(conn, META_KDF)?.ok_or(AppError::VaultMissing)?)?;
-        let pw_salt = hex::decode(meta_get(conn, META_PW_SALT)?.ok_or(AppError::VaultMissing)?)
-            .map_err(|_| AppError::crypto("corrupt salt"))?;
-        let master_wrap =
-            hex::decode(meta_get(conn, META_MASTER_WRAP)?.ok_or(AppError::VaultMissing)?)
-                .map_err(|_| AppError::crypto("corrupt master wrap"))?;
-        let verify = hex::decode(meta_get(conn, META_VERIFY)?.ok_or(AppError::VaultMissing)?)
-            .map_err(|_| AppError::crypto("corrupt verify blob"))?;
+/// Unlock using the master password against the sidecar.
+pub fn unlock(sc: &Sidecar, password: &str) -> Result<[u8; KEY_LEN]> {
+    let pw_salt = hex::decode(&sc.pw_salt).map_err(|_| AppError::crypto("corrupt salt"))?;
+    let master_wrap =
+        hex::decode(&sc.master_wrap).map_err(|_| AppError::crypto("corrupt master wrap"))?;
+    let verify = hex::decode(&sc.verify).map_err(|_| AppError::crypto("corrupt verify blob"))?;
 
-        let pw_key = crypto::derive_key(password, &pw_salt, &params)?;
-        let master_key = match crypto::decrypt(&pw_key, &master_wrap) {
-            Ok(k) if k.len() == KEY_LEN => {
-                let mut arr = [0u8; KEY_LEN];
-                arr.copy_from_slice(&k);
-                arr
-            }
-            _ => return Err(AppError::WrongPassword),
-        };
-        if !crypto::verify_key(&master_key, &verify) {
-            return Err(AppError::WrongPassword);
+    let pw_key = crypto::derive_key(password, &pw_salt, &sc.kdf)?;
+    let master_key = match crypto::decrypt(&pw_key, &master_wrap) {
+        Ok(k) if k.len() == KEY_LEN => {
+            let mut arr = [0u8; KEY_LEN];
+            arr.copy_from_slice(&k);
+            arr
         }
-        Ok(master_key)
-    } else {
-        unlock_legacy(conn, password)
+        _ => return Err(AppError::WrongPassword),
+    };
+    if !crypto::verify_key(&master_key, &verify) {
+        return Err(AppError::WrongPassword);
     }
+    Ok(master_key)
 }
 
 /// v1 legacy unlock: key derived directly from the password.
@@ -389,18 +327,16 @@ mod tests {
 
     #[test]
     fn create_then_unlock_v2() {
-        let conn = db::open_in_memory().unwrap();
-        let (k1, codes) = create(&conn, "hunter2").unwrap();
+        let (k1, sc, codes) = create("hunter2").unwrap();
         assert_eq!(codes.len(), RECOVERY_CODE_COUNT);
-        let k2 = unlock(&conn, "hunter2").unwrap();
+        let k2 = unlock(&sc, "hunter2").unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn unlock_wrong_password_fails() {
-        let conn = db::open_in_memory().unwrap();
-        create(&conn, "hunter2").unwrap();
-        assert!(matches!(unlock(&conn, "wrong"), Err(AppError::WrongPassword)));
+        let (_k, sc, _codes) = create("hunter2").unwrap();
+        assert!(matches!(unlock(&sc, "wrong"), Err(AppError::WrongPassword)));
     }
 
     #[test]
